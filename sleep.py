@@ -30,6 +30,14 @@ DEEP_BPM_MAX      = 12.0    # bpm
 DEEP_BPM_STD_MAX  = 1.2     # bpm std over 5 min
 REM_BPM_STD_MIN   = 2.0     # bpm std over 5 min suggests REM-ish
 
+# Presence detection thresholds (tune to your setup)
+PRESENCE_AMP_RMS_ON  = 0.006    # rad (phase RMS) to declare "present"
+PRESENCE_AMP_RMS_OFF = 0.0045       # rad (phase RMS) to declare "not present"
+PRESENCE_SNR_MIN     = 5.0      # minimum SNR to trust presence
+
+# Debounce (seconds)
+PRESENCE_ON_DEBOUNCE  = 5.0
+PRESENCE_OFF_DEBOUNCE = 5.0
 
 
 def safe_mean(x):
@@ -76,6 +84,24 @@ def classify_state(bpm_mean, bpm_std_s, bpm_std_l, amp_rms, snr_mean):
         return "sleep_REM"
     return "sleep_light"
 
+def auto_roi(client, cfg):
+    # client.start_session()
+    accum = None
+    for _ in range(int(5 * UPDATE_RATE_HZ)):
+        _, frame = client.get_next()  # IQ returns complex sweeps per bin
+        amp = np.abs(frame)           # use amplitude as a simple proxy here
+        accum = np.maximum(accum, amp) if accum is not None else amp
+    num_bins = accum.size
+    r0, r1 = cfg.range_interval
+    best_bin = int(np.argmax(accum))
+    best_m = r0 + (r1 - r0) * (best_bin + 0.5) / num_bins
+    roi_half = 0.08  # ±8 cm around best bin
+    roi_lo = max(r0, best_m - roi_half)
+    roi_hi = min(r1, best_m + roi_half)
+    print(f"Auto ROI -> [{roi_lo:.2f}, {roi_hi:.2f}] m (best ~{best_m:.2f} m)")
+    # client.stop_session()
+
+
 # --- Add just before start of main loop ---
 bpm_short = deque(maxlen=ROLL_SHORT_SEC)      # assume ~1 estimate per second
 bpm_long  = deque(maxlen=ROLL_LONG_SEC)
@@ -105,21 +131,8 @@ def main():
 
     # --- quick 5s pre-scan to auto-pick best bin for ROI ---
     client.start_session()
-    accum = None
-    for _ in range(int(5 * UPDATE_RATE_HZ)):
-        _, frame = client.get_next()  # IQ returns complex sweeps per bin
-        amp = np.abs(frame)           # use amplitude as a simple proxy here
-        accum = np.maximum(accum, amp) if accum is not None else amp
-    num_bins = accum.size
-    r0, r1 = cfg.range_interval
-    best_bin = int(np.argmax(accum))
-    best_m = r0 + (r1 - r0) * (best_bin + 0.5) / num_bins
-    roi_half = 0.08  # ±8 cm around best bin
-    roi_lo = max(r0, best_m - roi_half)
-    roi_hi = min(r1, best_m + roi_half)
-    print(f"Auto ROI -> [{roi_lo:.2f}, {roi_hi:.2f}] m (best ~{best_m:.2f} m)")
+    auto_roi(client, cfg)
     client.stop_session()
-
     # --- breathing processor config ---
     sb_cfg = SBProcCfg()
     sb_cfg.f_low = 0.02          # 6 BPM
@@ -135,28 +148,13 @@ def main():
     proc = SBProcessor(cfg, sb_cfg, si)
     client.start_session()
 
-    t0 = time.time()
     try:
-        # seen_keys = False
-        # while True:
-        #     info, iq = client.get_next()  # complex IQ per bin (shape: (bins,))
-        #     out = proc.process(iq, info)
-
-        #     if out is None:
-        #         print(f"Initializing… {(time.time()-t0):.1f}s")
-        #         continue
-
-        #     if not seen_keys:
-        #         print("Result keys:", list(out.keys()))
-        #         seen_keys = True
-
-        #     ip = out.get("init_progress")
-        #     if ip is not None and ip < 100:
-        #         print(f"Init {ip}%")
-        #         continue
 
         last_print = 0
         SNR_MIN = 0.0  # tune; start with 1–3
+        present = False
+        state_change_deadline = 0.0  # for debounce
+        was_not_present = False
 
         while True:
             info, iq = client.get_next()
@@ -172,13 +170,58 @@ def main():
                         print(f"Init {ip}%")
                         last_print = time.time()
                     continue
-            # print(out.keys())
-            f_dft_est = float(out.get("f_dft_est"))     # Hz
-            f_est     = float(out.get("f_est"))         # Hz
-            snr   = float(out.get("snr", 0.0))
+            # Extract current estimates
+            f_est = float(out.get("f_est", 0.0))        # Hz
+            f_dft_est = float(out.get("f_dft_est", 0.0))
+            snr = float(out.get("snr", 0.0))
+            bpm = f_est * 60.0 if f_est > 0 else 0.0
+            raw_bpm = f_dft_est * 60.0 if f_dft_est > 0 else 0.0
+            amp_rms = estimate_breath_amp(out)
+                        # -------- Presence detection with debounce --------
+            now = time.time()
+            want_present = (snr >= PRESENCE_SNR_MIN) and (amp_rms >= PRESENCE_AMP_RMS_ON)
+            want_absent  = (snr <  PRESENCE_SNR_MIN) or  (amp_rms <= PRESENCE_AMP_RMS_OFF)
 
-            # print(f_est)
-            # print(float(out.get("f_dft_est")))
+            if not present:
+                if want_present:
+                    # start debounce for presence ON
+                    if state_change_deadline == 0.0:
+                        state_change_deadline = now + PRESENCE_ON_DEBOUNCE
+                    elif now >= state_change_deadline:
+                        present = True
+                        state_change_deadline = 0.0
+                        print(">> Presence detected: START measuring")
+                        # reset rolling buffers for clean start
+                        bpm_short.clear(); bpm_long.clear()
+                        amp_short.clear(); snr_short.clear()
+                else:
+                    state_change_deadline = 0.0
+            else:
+                if want_absent:
+                    # start debounce for presence OFF
+                    if state_change_deadline == 0.0:
+                        state_change_deadline = now + PRESENCE_OFF_DEBOUNCE
+                    elif now >= state_change_deadline:
+                        present = False
+                        state_change_deadline = 0.0
+                        print("<< Presence lost: STOP measuring")
+                        continue  # skip rest; stay idle until present again
+                else:
+                    state_change_deadline = 0.0
+
+            # -------- If not present, idle --------
+            
+            if not present:
+                if int(now) % 5 == 0:
+                    print(f"[Idle] snr={snr:.1f}, amp_rms={amp_rms:.4f} rad")
+                time.sleep(0.1)
+                was_not_present = True
+                continue
+            if was_not_present and present:
+                auto_roi(client, cfg)
+                was_not_present = False
+
+            # -------- Present: update metrics & classify --------
             if (f_est > 0 and snr >= SNR_MIN) or f_dft_est > 0:
                 bpm = f_est * 60.0
                 raw_bpm = f_dft_est * 60.0
