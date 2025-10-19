@@ -259,8 +259,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        client.stop_session()
+        try:
+            client.stop_session()
+        except et.a111.ClientError:
+            pass
         client.disconnect()
+
 
 if __name__ == "__main__":
     main()
