@@ -48,19 +48,25 @@ def main():
     print("Session info:", si)
 
     plt.ion()
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12))
     
-    # Filtered Breathing Waveform plot
-    line1, = ax1.plot([], [])
+    # Raw Breathing Waveform plot
+    line_raw, = ax1.plot([], [])
     ax1.set_xlabel("Time (s)")
     ax1.set_ylabel("Phase")
-    ax1.set_title("Filtered Breathing Waveform")
+    ax1.set_title("Raw Breathing Waveform")
+
+    # Filtered Breathing Waveform plot
+    line1, = ax2.plot([], [])
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Phase")
+    ax2.set_title("Filtered Breathing Waveform")
 
     # Power Spectrum plot
-    line2, = ax2.plot([], [])
-    ax2.set_xlabel("Breathing Rate (BPM)")
-    ax2.set_ylabel("Power")
-    ax2.set_title("Breathing Rate Power Spectrum")
+    line2, = ax3.plot([], [])
+    ax3.set_xlabel("Breathing Rate (BPM)")
+    ax3.set_ylabel("Power")
+    ax3.set_title("Breathing Rate Power Spectrum")
     fig.tight_layout(pad=3.0)
 
     time_series_len = int(TIME_SERIES_DURATION_S * UPDATE_RATE_HZ)
@@ -119,14 +125,18 @@ def main():
                 breathing_rate_bpm = freqs * 60
 
                 # Update Plots
-                line1.set_data(time_history, filtered_phase)
+                line_raw.set_data(time_history, np.unwrap(phase_history))
                 ax1.relim()
                 ax1.autoscale_view()
 
-                line2.set_data(breathing_rate_bpm, power_spectrum)
+                line1.set_data(time_history, filtered_phase)
                 ax2.relim()
                 ax2.autoscale_view()
-                ax2.set_xlim(BREATHING_RATE_RANGE_BPM)
+
+                line2.set_data(breathing_rate_bpm, power_spectrum)
+                ax3.relim()
+                ax3.autoscale_view()
+                ax3.set_xlim(BREATHING_RATE_RANGE_BPM)
 
                 fig.canvas.draw()
                 fig.canvas.flush_events()
