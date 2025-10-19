@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import acconeer.exptool as et
+from acconeer.exptool.a111 import ClientError
 from acconeer.exptool.a111.algo.sleep_breathing import (
     Processor as SBProcessor,
     ProcessingConfiguration as SBProcCfg,
@@ -261,7 +262,7 @@ def main():
     finally:
         try:
             client.stop_session()
-        except et.ClientError:
+        except ClientError:
             pass
         client.disconnect()
 
