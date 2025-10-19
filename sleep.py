@@ -261,7 +261,7 @@ def main():
     finally:
         try:
             client.stop_session()
-        except et.a111.ClientError:
+        except et.ClientError:
             pass
         client.disconnect()
 
