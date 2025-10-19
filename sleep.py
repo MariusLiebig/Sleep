@@ -179,11 +179,24 @@ def main():
     proc = None
 
     plt.ion()
-    fig, ax = plt.subplots()
-    line, = ax.plot([], [])
-    ax.set_xlabel("Distance (m)")
-    ax.set_ylabel("Amplitude")
-    ax.set_title("Live Radar Data")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # Amplitude vs. Distance plot
+    line1, = ax1.plot([], [])
+    ax1.set_xlabel("Distance (m)")
+    ax1.set_ylabel("Amplitude")
+    ax1.set_title("Live Radar Data")
+
+    # Distance vs. Time plot
+    time_history = deque(maxlen=int(ROLL_LONG_SEC * UPDATE_RATE_HZ))
+    distance_history = deque(maxlen=int(ROLL_LONG_SEC * UPDATE_RATE_HZ))
+    line2, = ax2.plot([], [])
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Chest Distance (m)")
+    ax2.set_title("Chest Distance Over Time")
+    fig.tight_layout(pad=3.0)
+
+    start_time = time.time()
 
     try:
         si = client.setup_session(cfg)
@@ -196,9 +209,9 @@ def main():
             amp = np.abs(iq)
             num_bins = len(iq)
             distance = np.linspace(cfg.range_interval[0], cfg.range_interval[1], num_bins)
-            line.set_data(distance, amp)
-            ax.relim()
-            ax.autoscale_view()
+            line1.set_data(distance, amp)
+            ax1.relim()
+            ax1.autoscale_view()
             fig.canvas.draw()
             fig.canvas.flush_events()
             
@@ -207,7 +220,18 @@ def main():
             else:
                 out = None
 
-            if out is None:
+            if out is not None:
+                chest_dist = out.get("dist_est", float('nan'))
+                if np.isfinite(chest_dist):
+                    current_time = time.time() - start_time
+                    time_history.append(current_time)
+                    distance_history.append(chest_dist)
+
+                    line2.set_data(list(time_history), list(distance_history))
+                    ax2.relim()
+                    ax2.autoscale_view()
+
+            if out is None:    
                 # Still process presence to start the sensor
                 amp_rms_raw = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
                 
