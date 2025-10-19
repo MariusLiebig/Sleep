@@ -24,6 +24,7 @@ from acconeer.exptool.a111.algo.sleep_breathing import (
 )
 from collections import deque
 import statistics
+import matplotlib.pyplot as plt
 
 # Rolling windows
 ROLL_SHORT_SEC = 60      # short-term variability
@@ -177,6 +178,13 @@ def main():
     
     proc = None
 
+    plt.ion()
+    fig, ax = plt.subplots()
+    line, = ax.plot([], [])
+    ax.set_xlabel("Distance (m)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title("Live Radar Data")
+
     try:
         si = client.setup_session(cfg)
         print("Session info:", si)
@@ -184,6 +192,15 @@ def main():
 
         while True:
             info, iq = client.get_next()
+
+            amp = np.abs(iq)
+            num_bins = len(iq)
+            distance = np.linspace(cfg.range_interval[0], cfg.range_interval[1], num_bins)
+            line.set_data(distance, amp)
+            ax.relim()
+            ax.autoscale_view()
+            fig.canvas.draw()
+            fig.canvas.flush_events()
             
             if proc:
                 out = proc.process(iq, info)
