@@ -1,7 +1,23 @@
 import time
+from xmlrpc import client
 import numpy as np
 import acconeer.exptool as et
-from acconeer.exptool.a111 import ClientError
+# Robust import that works across exptool versions
+try:
+    # Newer exptool (3.x+)
+    from acconeer.exptool.clients.base import ClientError
+except ModuleNotFoundError:
+    try:
+        # Older exptool (2.x)
+        from acconeer.exptool.a111 import ClientError
+    except Exception:
+        # Very old fallback: if ClientError isn't available, use a generic Exception
+        class ClientError(Exception):
+            pass
+# put near the other imports, at the top
+from acconeer.exptool.a111._clients.base import ClientError
+from acconeer.exptool._core.communication.links.buffered_link import LinkError
+
 from acconeer.exptool.a111.algo.sleep_breathing import (
     Processor as SBProcessor,
     ProcessingConfiguration as SBProcCfg,
@@ -89,15 +105,30 @@ def classify_state(bpm_mean, bpm_std_s, bpm_std_l, amp_rms, snr_mean):
 
 
 def auto_roi(client, cfg):
+    """
+    Compute a simple amplitude-based ROI from the currently running session.
+    Assumes the IQ service session is already started.
+    """
     print("Starting automatic ROI detection...")
-    client.start_session()
     accum = None
-    for _ in range(int(5 * UPDATE_RATE_HZ)):
-        _, frame = client.get_next()  # IQ returns complex sweeps per bin
-        amp = np.abs(frame)           # use amplitude as a simple proxy here
+
+    # allow a brief warm-up
+    time.sleep(0.1)
+
+    n_frames = int(5 * UPDATE_RATE_HZ)
+    got = 0
+
+    while got < n_frames:
+        try:
+            info, frame = client.get_next()  # IQ returns complex sweeps per bin
+        except LinkError:
+            # transient read hiccup; wait a bit and retry
+            time.sleep(0.05)
+            continue
+
+        amp = np.abs(frame)  # amplitude proxy
         accum = np.maximum(accum, amp) if accum is not None else amp
-    
-    client.stop_session()
+        got += 1
 
     num_bins = accum.size
     r0, r1 = cfg.range_interval
@@ -108,6 +139,7 @@ def auto_roi(client, cfg):
     roi_hi = min(r1, best_m + roi_half)
     print(f"Auto ROI -> [{roi_lo:.2f}, {roi_hi:.2f}] m (best ~{best_m:.2f} m)")
     return (roi_lo, roi_hi)
+
 
 
 def main():
@@ -173,14 +205,22 @@ def main():
                         state_change_deadline = 0.0
                         print(">> Presence detected: START measuring")
                         
-                        # Run Auto ROI and reconfigure processor
-                        client.stop_session()
                         roi = auto_roi(client, cfg)
-                        sb_cfg.dist_range = roi
-                        
+                        cfg.range_interval = roi
+
+                        # To apply a changed service config, stop → setup → start once
+                        try:
+                            client.stop_session()
+                        except ClientError:
+                            pass
+
                         si = client.setup_session(cfg)
                         proc = SBProcessor(cfg, sb_cfg, si)
                         client.start_session()
+
+                        # Clear rolling buffers for a clean start after ROI change
+                        bpm_short.clear(); bpm_long.clear()
+                        amp_short.clear(); snr_short.clear()
 
                         # Reset rolling buffers for clean start
                         bpm_short.clear(); bpm_long.clear()
@@ -203,6 +243,7 @@ def main():
             f_est = float(out.get("f_est", 0.0))
             snr = float(out.get("snr", 0.0))
             bpm = f_est * 60.0 if f_est > 0 else 0.0
+            bpm_dft = float(out.get("f_dft_est", 0.0))*60
             amp_rms = estimate_breath_amp(out)
 
             # -------- Presence detection with debounce --------
@@ -214,14 +255,16 @@ def main():
                     state_change_deadline = now + PRESENCE_OFF_DEBOUNCE
                 elif now >= state_change_deadline:
                     present = False
-                    proc = None # Stop processing
+                    proc = None  # Stop processing
                     state_change_deadline = 0.0
                     print("<< Presence lost: STOP measuring")
-                    
-                    # Go back to idle mode
-                    client.stop_session()
+                    try:
+                        client.stop_session()
+                    except ClientError:
+                        pass
                     si = client.setup_session(cfg)
                     client.start_session()
+
             elif present:
                 state_change_deadline = 0.0
 
@@ -236,7 +279,7 @@ def main():
             snr_short.append(snr)
             amp_short.append(amp_rms)
 
-            print(f"BPM: {bpm:5.2f} (SNR={snr:.2f}, Amp_RMS={amp_rms:.4f})")
+            print(f"BPM: {bpm:5.2f} BMP DFT: {bpm_dft:5.2f} (SNR={snr:.2f}, Amp_RMS={amp_rms:.4f})")
 
             # Every PRINT_STATE_EVERY seconds, output state
             if now - last_state_print >= PRINT_STATE_EVERY:
