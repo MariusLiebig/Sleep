@@ -46,11 +46,13 @@ def safe_mean(x):
     except statistics.StatisticsError:
         return float('nan')
 
+
 def safe_std(x):
     try:
         return statistics.pstdev(x)
     except statistics.StatisticsError:
         return float('nan')
+
 
 def estimate_breath_amp(out):
     # Prefer phi_filt if present, else phi_raw
@@ -84,13 +86,18 @@ def classify_state(bpm_mean, bpm_std_s, bpm_std_l, amp_rms, snr_mean):
         return "sleep_REM"
     return "sleep_light"
 
+
 def auto_roi(client, cfg):
-    # client.start_session()
+    print("Starting automatic ROI detection...")
+    client.start_session()
     accum = None
     for _ in range(int(5 * UPDATE_RATE_HZ)):
         _, frame = client.get_next()  # IQ returns complex sweeps per bin
         amp = np.abs(frame)           # use amplitude as a simple proxy here
         accum = np.maximum(accum, amp) if accum is not None else amp
+    
+    client.stop_session()
+
     num_bins = accum.size
     r0, r1 = cfg.range_interval
     best_bin = int(np.argmax(accum))
@@ -99,155 +106,138 @@ def auto_roi(client, cfg):
     roi_lo = max(r0, best_m - roi_half)
     roi_hi = min(r1, best_m + roi_half)
     print(f"Auto ROI -> [{roi_lo:.2f}, {roi_hi:.2f}] m (best ~{best_m:.2f} m)")
-    # client.stop_session()
+    return (roi_lo, roi_hi)
 
-
-# --- Add just before start of main loop ---
-bpm_short = deque(maxlen=ROLL_SHORT_SEC)      # assume ~1 estimate per second
-bpm_long  = deque(maxlen=ROLL_LONG_SEC)
-amp_short = deque(maxlen=ROLL_SHORT_SEC)
-snr_short = deque(maxlen=ROLL_SHORT_SEC)
 
 def main():
-    last_state_print = 0.0
-
     args = et.a111.ExampleArgumentParser().parse_args()
     et.utils.config_logging(args)
 
     client = et.a111.Client(**et.a111.get_client_args(args))
 
-    # >>> IQ service (NOT Envelope) <<<
+    # IQ service config
     cfg = et.a111.IQServiceConfig()
     cfg.sensor = args.sensors
     cfg.range_interval = RANGE_INTERVAL
     cfg.update_rate = UPDATE_RATE_HZ
-    # Optional but often good for respiration:
-    # cfg.downsampling_factor = 1
-    # cfg.gain = 0.5
-
+    
     client.connect()
-    si = client.setup_session(cfg)
-    print("Session info:", si)
-
-    # --- quick 5s pre-scan to auto-pick best bin for ROI ---
-    client.start_session()
-    auto_roi(client, cfg)
-    client.stop_session()
-    # --- breathing processor config ---
+    
+    # Breathing processor config
     sb_cfg = SBProcCfg()
-    sb_cfg.f_low = 0.02          # 6 BPM
+    sb_cfg.f_low = 0.02          # 1.2 BPM
     sb_cfg.f_high = 0.6         # 36 BPM
     sb_cfg.n_dft = 12.0         # shorter warm-up while testing
     sb_cfg.t_freq_est = 0.25
     sb_cfg.lambda_p = 60.0
     sb_cfg.lambda_05 = 1.0
-    # sb_cfg.dist_range = (roi_lo, roi_hi)  # **important**
 
-    # Re-setup & start with same cfg
-    si = client.setup_session(cfg)
-    proc = SBProcessor(cfg, sb_cfg, si)
-    client.start_session()
+    # Data buffers
+    bpm_short = deque(maxlen=int(ROLL_SHORT_SEC * UPDATE_RATE_HZ))
+    bpm_long  = deque(maxlen=int(ROLL_LONG_SEC * UPDATE_RATE_HZ))
+    amp_short = deque(maxlen=int(ROLL_SHORT_SEC * UPDATE_RATE_HZ))
+    snr_short = deque(maxlen=int(ROLL_SHORT_SEC * UPDATE_RATE_HZ))
+
+    present = False
+    state_change_deadline = 0.0
+    last_state_print = 0.0
+    
+    proc = None
 
     try:
-
-        last_print = 0
-        SNR_MIN = 0.0  # tune; start with 1–3
-        present = False
-        state_change_deadline = 0.0  # for debounce
-        was_not_present = False
+        si = client.setup_session(cfg)
+        print("Session info:", si)
+        client.start_session()
 
         while True:
             info, iq = client.get_next()
-            out = proc.process(iq, info)
+            
+            if proc:
+                out = proc.process(iq, info)
+            else:
+                out = None
 
             if out is None:
-                continue
+                # Still process presence to start the sensor
+                amp_rms_raw = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
+                
+                now = time.time()
+                want_present = (amp_rms_raw >= PRESENCE_AMP_RMS_ON)
 
-            ip = out.get("init_progress", 0)
-            if ip is not None:
-                if ip < 100:
-                    if time.time() - last_print > 0.5:
-                        print(f"Init {ip}%")
-                        last_print = time.time()
-                    continue
-            # Extract current estimates
-            f_est = float(out.get("f_est", 0.0))        # Hz
-            f_dft_est = float(out.get("f_dft_est", 0.0))
-            snr = float(out.get("snr", 0.0))
-            bpm = f_est * 60.0 if f_est > 0 else 0.0
-            raw_bpm = f_dft_est * 60.0 if f_dft_est > 0 else 0.0
-            amp_rms = estimate_breath_amp(out)
-                        # -------- Presence detection with debounce --------
-            now = time.time()
-            want_present = (snr >= PRESENCE_SNR_MIN) and (amp_rms >= PRESENCE_AMP_RMS_ON)
-            want_absent  = (snr <  PRESENCE_SNR_MIN) or  (amp_rms <= PRESENCE_AMP_RMS_OFF)
-
-            if not present:
-                if want_present:
-                    # start debounce for presence ON
+                if not present and want_present:
                     if state_change_deadline == 0.0:
                         state_change_deadline = now + PRESENCE_ON_DEBOUNCE
                     elif now >= state_change_deadline:
                         present = True
                         state_change_deadline = 0.0
                         print(">> Presence detected: START measuring")
-                        # reset rolling buffers for clean start
+                        
+                        # Run Auto ROI and reconfigure processor
+                        client.stop_session()
+                        roi = auto_roi(client, cfg)
+                        sb_cfg.dist_range = roi
+                        
+                        si = client.setup_session(cfg)
+                        proc = SBProcessor(cfg, sb_cfg, si)
+                        client.start_session()
+
+                        # Reset rolling buffers for clean start
                         bpm_short.clear(); bpm_long.clear()
                         amp_short.clear(); snr_short.clear()
-                else:
-                    state_change_deadline = 0.0
-            else:
-                if want_absent:
-                    # start debounce for presence OFF
-                    if state_change_deadline == 0.0:
-                        state_change_deadline = now + PRESENCE_OFF_DEBOUNCE
-                    elif now >= state_change_deadline:
-                        present = False
-                        state_change_deadline = 0.0
-                        print("<< Presence lost: STOP measuring")
-                        continue  # skip rest; stay idle until present again
-                else:
-                    state_change_deadline = 0.0
+                elif not present:
+                     state_change_deadline = 0.0
+                     print(f"[Idle] amp_rms_raw={amp_rms_raw:.4f} rad")
+                     time.sleep(0.1)
 
-            # -------- If not present, idle --------
-            
-            if not present:
-                if int(now) % 5 == 0:
-                    print(f"[Idle] snr={snr:.1f}, amp_rms={amp_rms:.4f} rad")
-                time.sleep(0.1)
-                was_not_present = True
                 continue
-            if was_not_present and present:
-                auto_roi(client, cfg)
-                was_not_present = False
 
-            # -------- Present: update metrics & classify --------
-            if (f_est > 0 and snr >= SNR_MIN) or f_dft_est > 0:
-                bpm = f_est * 60.0
-                raw_bpm = f_dft_est * 60.0
-                print(f"BPM: {bpm:5.2f} , raw BPM: {raw_bpm:5.2f} (f_est={f_est:.3f} Hz, SNR={snr:.2f})")
-            else:
-                # helpful debug
-                print(f"No reliable estimate yet (f_est={f_est:.3f} Hz, SNR={snr:.2f})")
+            ip = out.get("init_progress", 0)
+            if ip is not None and ip < 100:
+                if time.time() - last_state_print > 0.5:
+                    print(f"Init {ip}%")
+                    last_state_print = time.time()
+                continue
 
-            # inside while True: after you compute bpm, raw_bpm, snr...
+            # Extract current estimates
+            f_est = float(out.get("f_est", 0.0))
+            snr = float(out.get("snr", 0.0))
+            bpm = f_est * 60.0 if f_est > 0 else 0.0
             amp_rms = estimate_breath_amp(out)
 
-            # Update rolling buffers (1 Hz loop assumed)
+            # -------- Presence detection with debounce --------
+            now = time.time()
+            want_absent  = (snr <  PRESENCE_SNR_MIN) or  (amp_rms <= PRESENCE_AMP_RMS_OFF)
+
+            if present and want_absent:
+                if state_change_deadline == 0.0:
+                    state_change_deadline = now + PRESENCE_OFF_DEBOUNCE
+                elif now >= state_change_deadline:
+                    present = False
+                    proc = None # Stop processing
+                    state_change_deadline = 0.0
+                    print("<< Presence lost: STOP measuring")
+                    
+                    # Go back to idle mode
+                    client.stop_session()
+                    si = client.setup_session(cfg)
+                    client.start_session()
+            elif present:
+                state_change_deadline = 0.0
+
+
+            if not present:
+                continue
+
+            # -------- Present: update metrics & classify --------
             if np.isfinite(bpm):
                 bpm_short.append(bpm)
                 bpm_long.append(bpm)
             snr_short.append(snr)
             amp_short.append(amp_rms)
 
-            # Print continuous BPM line as you already do
-            if (f_est > 0 and snr >= 0) or f_dft_est > 0:
-                print(f"BPM: {bpm:5.2f} , raw BPM: {raw_bpm:5.2f} (f_est={f_est:.3f} Hz, SNR={snr:.2f})")
-            else:
-                print(f"No reliable estimate yet (f_est={f_est:.3f} Hz, SNR={snr:.2f})")
+            print(f"BPM: {bpm:5.2f} (SNR={snr:.2f}, Amp_RMS={amp_rms:.4f})")
 
             # Every PRINT_STATE_EVERY seconds, output state
-            now = time.time()
             if now - last_state_print >= PRINT_STATE_EVERY:
                 last_state_print = now
                 bpm_mean_s = safe_mean(bpm_short)
@@ -260,12 +250,11 @@ def main():
                 state = classify_state(bpm_mean_l, bpm_std_s, bpm_std_l, amp_mean, snr_mean)
 
                 print(
-                    f"[State] {state} | "
+                    f"\n[State] {state} | "
                     f"bpm_mean_1m={bpm_mean_s:.2f}, bpm_std_1m={bpm_std_s:.2f}, "
                     f"bpm_mean_5m={bpm_mean_l:.2f}, bpm_std_5m={bpm_std_l:.2f}, "
-                    f"amp_rms={amp_mean:.4f} rad, snr={snr_mean:.2f}"
+                    f"amp_rms={amp_mean:.4f} rad, snr={snr_mean:.2f}\n"
                 )
-
 
     except KeyboardInterrupt:
         pass
